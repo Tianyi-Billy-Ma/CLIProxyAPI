@@ -1,0 +1,148 @@
+# Fork-only: weekly merge of upstream router-for-me/CLIProxyAPI main into main.
+# Never force-pushes. On a merge conflict, failing build/tests or a rejected
+# push it opens (or comments on) an issue labelled upstream-sync, leaves main
+# untouched and fails the run.
+# Pushing upstream workflow-file changes needs a token with the workflow scope:
+# set secret SYNC_TOKEN (fine-grained PAT, contents + workflows write) for that.
+name: fork-upstream-sync
+
+on:
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-upstream-sync
+
+jobs:
+  # Runs merged upstream code, so it gets no write credentials.
+  merge:
+    if: github.repository == 'Tianyi-Billy-Ma/CLIProxyAPI'
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.merge.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git
+          git fetch --tags upstream main
+          : > /tmp/report.md
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "result=noop" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-ff --no-edit upstream/main; then
+            { echo "Merge conflict in:"; echo '```'; git diff --name-only --diff-filter=U; echo '```'; } > /tmp/report.md
+            git merge --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="$(git describe --tags --abbrev=0 --match 'v[0-9]*' upstream/main)"
+          if [ "$version" != "$(cat .github/fork/upstream-version)" ]; then
+            echo "$version" > .github/fork/upstream-version
+            git add .github/fork/upstream-version
+            git commit -m "chore(fork): track upstream $version"
+          fi
+          git bundle create /tmp/merged.bundle origin/main..HEAD
+          echo "result=merged" >> "$GITHUB_OUTPUT"
+      # Freeze the candidate before any merged code runs, so tests cannot alter what gets pushed.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync
+          path: |
+            /tmp/merged.bundle
+            /tmp/report.md
+          if-no-files-found: ignore
+      - name: Build and test merged tree
+        if: steps.merge.outputs.result == 'merged'
+        run: |
+          if ! { go build -o /tmp/cli-proxy-api ./cmd/server && bash .github/fork/test.sh; } > /tmp/test.log 2>&1; then
+            { echo "Merged tree fails build or fork tests (last lines):"; echo '```'; tail -60 /tmp/test.log; echo '```'; } > /tmp/test-report.md
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-report
+          path: /tmp/test-report.md
+          if-no-files-found: ignore
+
+  publish:
+    needs: merge
+    # Runs after a failed test step too, to report it; never executes merged code.
+    if: always() && needs.merge.outputs.result != 'noop' && needs.merge.outputs.result != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync
+          path: /tmp/sync
+      - uses: actions/download-artifact@v4
+        if: needs.merge.result != 'success'
+        continue-on-error: true
+        with:
+          name: test-report
+          path: /tmp/test
+      - name: Push merged main
+        id: push
+        if: needs.merge.outputs.result == 'merged' && needs.merge.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' && 'yes' || '' }}
+        run: |
+          set -euo pipefail
+          git fetch /tmp/sync/merged.bundle HEAD
+          if git push origin FETCH_HEAD:refs/heads/main; then
+            # A push made with GITHUB_TOKEN does not fire the image workflow's push trigger.
+            if [ -z "${HAS_SYNC_TOKEN}" ]; then gh workflow run fork-image.yml --ref main; fi
+          else
+            echo "Push to main was rejected (if upstream changed workflow files, set SYNC_TOKEN with workflows write)." > /tmp/sync/report.md
+            echo "rejected=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Report problem
+        if: needs.merge.outputs.result != 'merged' || needs.merge.result != 'success' || steps.push.outputs.rejected == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            echo "Upstream sync could not land on main ($(date -u +%Y-%m-%d)). Run: ${run_url}"
+            echo
+            cat /tmp/sync/report.md /tmp/test/test-report.md 2>/dev/null || true
+            echo
+            echo "Resolve locally: git fetch https://github.com/router-for-me/CLIProxyAPI.git main && git merge FETCH_HEAD, then push without force."
+          } > /tmp/issue.md
+          gh label create upstream-sync --color D93F0B --force >/dev/null 2>&1 || true
+          existing="$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file /tmp/issue.md
+          else
+            gh issue create --title "Upstream sync needs attention" --label upstream-sync --body-file /tmp/issue.md
+          fi
+          exit 1
