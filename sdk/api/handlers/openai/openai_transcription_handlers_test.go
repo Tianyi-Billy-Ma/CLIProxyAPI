@@ -3,6 +3,7 @@ package openai
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -246,31 +247,56 @@ func TestAudioTranscriptionRetrieveUnknown(t *testing.T) {
 func TestTranscriptionJobStoreTTL(t *testing.T) {
 	now := time.Date(2026, 11, 23, 0, 0, 0, 0, time.UTC)
 	store := &transcriptionJobStore{jobs: map[string]*transcriptionJob{}, now: func() time.Time { return now }}
-	done := store.create()
-	pending := store.create()
+	done, _ := store.create("k1")
+	pending, _ := store.create("k1")
 	store.complete(done.id, []byte("plain text result"))
-	failed := store.create()
-	store.fail(failed.id, &interfaces.ErrorMessage{StatusCode: 502})
+	failed, _ := store.create("k1")
+	store.fail(failed.id, &interfaces.ErrorMessage{StatusCode: 413, Error: errors.New(`{"error":{"message":"audio longer than 300 seconds","code":"audio_too_long"}}`)})
 
-	if body, ok := store.render(done.id); !ok || ojson.GetBytes(body, "text").String() != "plain text result" {
+	if body, ok := store.render(done.id, "k1"); !ok || ojson.GetBytes(body, "text").String() != "plain text result" {
 		t.Fatalf("non-JSON result render = %s %v", body, ok)
 	}
-	if body, _ := store.render(failed.id); ojson.GetBytes(body, "error.code").String() != "502" {
+	if _, ok := store.render(done.id, "k2"); ok {
+		t.Fatal("job visible to another API key")
+	}
+	if body, _ := store.render(failed.id, "k1"); ojson.GetBytes(body, "error.code").String() != "audio_too_long" ||
+		ojson.GetBytes(body, "error.message").String() != "audio longer than 300 seconds" {
 		t.Fatalf("failed render = %s", body)
 	}
 	now = now.Add(transcriptionJobTTL - time.Second)
-	if _, ok := store.render(done.id); !ok {
+	if _, ok := store.render(done.id, "k1"); !ok {
 		t.Fatal("job evicted before TTL")
 	}
 	now = now.Add(2 * time.Second)
-	if _, ok := store.render(done.id); ok {
+	if _, ok := store.render(done.id, "k1"); ok {
 		t.Fatal("completed job kept after TTL")
 	}
-	if _, ok := store.render(failed.id); ok {
+	if _, ok := store.render(failed.id, "k1"); ok {
 		t.Fatal("failed job kept after TTL")
 	}
-	if _, ok := store.render(pending.id); !ok {
+	if _, ok := store.render(pending.id, "k1"); !ok {
 		t.Fatal("unfinished job must not expire")
+	}
+}
+
+func TestTranscriptionJobStoreLimitsActiveJobs(t *testing.T) {
+	store := &transcriptionJobStore{jobs: map[string]*transcriptionJob{}, now: time.Now}
+	var first *transcriptionJob
+	for i := 0; i < maxActiveTranscriptionJobs; i++ {
+		job, ok := store.create("k")
+		if !ok {
+			t.Fatalf("create %d rejected", i)
+		}
+		if first == nil {
+			first = job
+		}
+	}
+	if _, ok := store.create("k"); ok {
+		t.Fatal("create beyond the active limit accepted")
+	}
+	store.complete(first.id, []byte(`{}`))
+	if _, ok := store.create("k"); !ok {
+		t.Fatal("finished job still counted as active")
 	}
 }
 

@@ -11,6 +11,9 @@ permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: fork-image
+
 env:
   IMAGE: ghcr.io/tianyi-billy-ma/cli-proxy-api
 
@@ -24,6 +27,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -36,6 +41,10 @@ jobs:
           echo "VERSION=${upstream}-asr.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          # Only main may move :latest; other refs get immutable tags only.
+          if [ "${GITHUB_REF}" = refs/heads/main ]; then
+            echo "LATEST_TAG=${IMAGE}:latest" >> "$GITHUB_ENV"
+          fi
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -54,5 +63,5 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ env.VERSION }}
             ${{ env.IMAGE }}:sha-${{ env.COMMIT }}
-            ${{ env.IMAGE }}:latest
+            ${{ env.LATEST_TAG }}
       - run: echo "Pushed ${IMAGE}:${VERSION}" >> "$GITHUB_STEP_SUMMARY"

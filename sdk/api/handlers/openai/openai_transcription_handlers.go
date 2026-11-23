@@ -28,6 +28,8 @@ const (
 	openAITranscriptionHandlerType = "openai-transcription"
 	openAITranscriptionPath        = "/v1/audio/transcriptions"
 	transcriptionJobTTL            = 24 * time.Hour
+	// maxActiveTranscriptionJobs bounds async uploads held in memory at once.
+	maxActiveTranscriptionJobs = 32
 )
 
 // AudioTranscriptions proxies an OpenAI multipart transcription request to an
@@ -59,7 +61,11 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 		handlers.WriteUpstreamHeaders(c.Writer.Header(), resp.Headers)
 		c.Writer.Header().Del("Content-Length")
 		if c.Writer.Header().Get("Content-Type") == "" {
-			c.Header("Content-Type", "application/json")
+			if ojson.ValidBytes(resp.Body) {
+				c.Header("Content-Type", "application/json")
+			} else {
+				c.Header("Content-Type", "text/plain; charset=utf-8")
+			}
 		}
 		c.Status(http.StatusOK)
 		_, _ = c.Writer.Write(resp.Body)
@@ -67,11 +73,21 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 		return
 	}
 
-	job := transcriptionJobs.create()
+	job, ok := transcriptionJobs.create(c.GetString("userApiKey"))
+	if !ok {
+		c.JSON(http.StatusTooManyRequests, handlers.ErrorResponse{Error: handlers.ErrorDetail{
+			Message: fmt.Sprintf("too many transcription jobs in progress (limit %d)", maxActiveTranscriptionJobs),
+			Type:    "rate_limit_error",
+			Code:    "too_many_jobs",
+		}})
+		return
+	}
+	// The job outlives the request: keep request-scoped values (usage identity)
+	// but neither its cancellation nor the pooled gin context.
+	jobCtx := context.WithoutCancel(c.Request.Context())
 	go func() {
 		transcriptionJobs.setStatus(job.id, "processing")
-		// The job outlives the HTTP request, so it must not inherit the gin context.
-		resp, errMsg := h.executeTranscription(context.Background(), model, raw, headers)
+		resp, errMsg := h.executeTranscription(jobCtx, model, raw, headers)
 		if errMsg != nil {
 			transcriptionJobs.fail(job.id, errMsg)
 			return
@@ -83,7 +99,7 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 
 // AudioTranscriptionRetrieve returns the state of an async transcription job.
 func (h *OpenAIAPIHandler) AudioTranscriptionRetrieve(c *gin.Context) {
-	body, ok := transcriptionJobs.render(c.Param("id"))
+	body, ok := transcriptionJobs.render(c.Param("id"), c.GetString("userApiKey"))
 	if !ok {
 		c.JSON(http.StatusNotFound, handlers.ErrorResponse{Error: handlers.ErrorDetail{
 			Message: "transcription job not found",
@@ -160,6 +176,7 @@ func transcriptionModelFromMultipart(raw []byte, contentType string) (string, er
 
 type transcriptionJob struct {
 	id       string
+	owner    string
 	status   string
 	result   []byte
 	errMsg   string
@@ -168,8 +185,9 @@ type transcriptionJob struct {
 }
 
 // transcriptionJobStore keeps async jobs in memory; finished jobs expire after
-// transcriptionJobTTL. shortcut: jobs are lost on restart and visible to any
-// valid API key holding the id; persist or scope per key if multi-tenant use appears.
+// transcriptionJobTTL and are only visible to the API key that created them.
+// shortcut: jobs are lost on restart and expired ones are swept lazily on
+// create/poll; persist them if restarts mid-job become a problem.
 type transcriptionJobStore struct {
 	mu   sync.Mutex
 	jobs map[string]*transcriptionJob
@@ -178,17 +196,27 @@ type transcriptionJobStore struct {
 
 var transcriptionJobs = &transcriptionJobStore{jobs: map[string]*transcriptionJob{}, now: time.Now}
 
-func (s *transcriptionJobStore) create() *transcriptionJob {
+func (s *transcriptionJobStore) create(owner string) (*transcriptionJob, bool) {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		log.Errorf("transcription: random job id: %v", err)
+		return nil, false
 	}
-	job := &transcriptionJob{id: "transcr_" + hex.EncodeToString(buf[:]), status: "queued"}
+	job := &transcriptionJob{id: "transcr_" + hex.EncodeToString(buf[:]), owner: owner, status: "queued"}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.evictLocked()
+	active := 0
+	for _, existing := range s.jobs {
+		if existing.finished.IsZero() {
+			active++
+		}
+	}
+	if active >= maxActiveTranscriptionJobs {
+		return nil, false
+	}
 	s.jobs[job.id] = job
-	return job
+	return job, true
 }
 
 func (s *transcriptionJobStore) setStatus(id, status string) {
@@ -210,11 +238,20 @@ func (s *transcriptionJobStore) complete(id string, result []byte) {
 func (s *transcriptionJobStore) fail(id string, errMsg *interfaces.ErrorMessage) {
 	message, code := "transcription failed", "upstream_error"
 	if errMsg != nil {
-		if errMsg.Error != nil {
-			message = errMsg.Error.Error()
-		}
 		if errMsg.StatusCode > 0 {
 			code = strconv.Itoa(errMsg.StatusCode)
+		}
+		if errMsg.Error != nil {
+			message = errMsg.Error.Error()
+			// Keep the upstream OpenAI error envelope's own message and code.
+			if upstream := []byte(message); ojson.ValidBytes(upstream) {
+				if m := ojson.GetBytes(upstream, "error.message").String(); m != "" {
+					message = m
+				}
+				if cv := ojson.GetBytes(upstream, "error.code").String(); cv != "" {
+					code = cv
+				}
+			}
 		}
 	}
 	s.mu.Lock()
@@ -234,12 +271,16 @@ func (s *transcriptionJobStore) evictLocked() {
 }
 
 // render returns the poll response body for a job, or false when it is unknown or expired.
-func (s *transcriptionJobStore) render(id string) ([]byte, bool) {
+func (s *transcriptionJobStore) render(id, owner string) ([]byte, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.evictLocked()
-	job := s.jobs[id]
-	if job == nil {
+	stored := s.jobs[id]
+	var job transcriptionJob
+	if stored != nil {
+		job = *stored
+	}
+	s.mu.Unlock()
+	if stored == nil || job.owner != owner {
 		return nil, false
 	}
 	var doc *ojson.Doc
