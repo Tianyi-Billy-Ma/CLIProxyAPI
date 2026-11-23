@@ -59,13 +59,9 @@ jobs:
             git add .github/fork/upstream-version
             git commit -m "chore(fork): track upstream $version"
           fi
-          if ! { go build -o /tmp/cli-proxy-api ./cmd/server && bash .github/fork/test.sh; } > /tmp/test.log 2>&1; then
-            { echo "Merged tree fails build or fork tests (last lines):"; echo '```'; tail -60 /tmp/test.log; echo '```'; } > /tmp/report.md
-            echo "result=broken" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           git bundle create /tmp/merged.bundle origin/main..HEAD
           echo "result=merged" >> "$GITHUB_OUTPUT"
+      # Freeze the candidate before any merged code runs, so tests cannot alter what gets pushed.
       - uses: actions/upload-artifact@v4
         with:
           name: sync
@@ -73,10 +69,24 @@ jobs:
             /tmp/merged.bundle
             /tmp/report.md
           if-no-files-found: ignore
+      - name: Build and test merged tree
+        if: steps.merge.outputs.result == 'merged'
+        run: |
+          if ! { go build -o /tmp/cli-proxy-api ./cmd/server && bash .github/fork/test.sh; } > /tmp/test.log 2>&1; then
+            { echo "Merged tree fails build or fork tests (last lines):"; echo '```'; tail -60 /tmp/test.log; echo '```'; } > /tmp/test-report.md
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-report
+          path: /tmp/test-report.md
+          if-no-files-found: ignore
 
   publish:
     needs: merge
-    if: needs.merge.outputs.result != 'noop'
+    # Runs after a failed test step too, to report it; never executes merged code.
+    if: always() && needs.merge.outputs.result != 'noop' && needs.merge.outputs.result != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -92,9 +102,15 @@ jobs:
         with:
           name: sync
           path: /tmp/sync
+      - uses: actions/download-artifact@v4
+        if: needs.merge.result != 'success'
+        continue-on-error: true
+        with:
+          name: test-report
+          path: /tmp/test
       - name: Push merged main
         id: push
-        if: needs.merge.outputs.result == 'merged'
+        if: needs.merge.outputs.result == 'merged' && needs.merge.result == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
           HAS_SYNC_TOKEN: ${{ secrets.SYNC_TOKEN != '' && 'yes' || '' }}
@@ -109,7 +125,7 @@ jobs:
             echo "rejected=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Report problem
-        if: needs.merge.outputs.result != 'merged' || steps.push.outputs.rejected == 'true'
+        if: needs.merge.outputs.result != 'merged' || needs.merge.result != 'success' || steps.push.outputs.rejected == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -118,7 +134,7 @@ jobs:
           {
             echo "Upstream sync could not land on main ($(date -u +%Y-%m-%d)). Run: ${run_url}"
             echo
-            cat /tmp/sync/report.md 2>/dev/null || true
+            cat /tmp/sync/report.md /tmp/test/test-report.md 2>/dev/null || true
             echo
             echo "Resolve locally: git fetch https://github.com/router-for-me/CLIProxyAPI.git main && git merge FETCH_HEAD, then push without force."
           } > /tmp/issue.md

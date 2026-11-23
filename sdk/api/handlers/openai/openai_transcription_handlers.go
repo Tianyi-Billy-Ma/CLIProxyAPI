@@ -73,7 +73,7 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 		return
 	}
 
-	job, ok := transcriptionJobs.create(c.GetString("userApiKey"))
+	job, ok := transcriptionJobs.create(transcriptionJobOwner(c))
 	if !ok {
 		c.JSON(http.StatusTooManyRequests, handlers.ErrorResponse{Error: handlers.ErrorDetail{
 			Message: fmt.Sprintf("too many transcription jobs in progress (limit %d)", maxActiveTranscriptionJobs),
@@ -99,7 +99,7 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 
 // AudioTranscriptionRetrieve returns the state of an async transcription job.
 func (h *OpenAIAPIHandler) AudioTranscriptionRetrieve(c *gin.Context) {
-	body, ok := transcriptionJobs.render(c.Param("id"), c.GetString("userApiKey"))
+	body, ok := transcriptionJobs.render(c.Param("id"), transcriptionJobOwner(c))
 	if !ok {
 		c.JSON(http.StatusNotFound, handlers.ErrorResponse{Error: handlers.ErrorDetail{
 			Message: "transcription job not found",
@@ -120,6 +120,11 @@ func (h *OpenAIAPIHandler) executeTranscription(ctx context.Context, model strin
 		Headers:       headers,
 		Path:          openAITranscriptionPath,
 	})
+}
+
+// transcriptionJobOwner identifies the authenticated caller (access provider + principal).
+func transcriptionJobOwner(c *gin.Context) string {
+	return c.GetString("accessProvider") + "\x00" + c.GetString("userApiKey")
 }
 
 func preferRespondAsync(header http.Header) bool {
