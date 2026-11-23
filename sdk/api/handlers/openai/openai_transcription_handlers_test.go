@@ -31,7 +31,7 @@ type capturedTranscription struct {
 	fileBytes                                   []byte
 }
 
-func newTranscriptionTestServer(t *testing.T, status int, body string) (*gin.Engine, func() []capturedTranscription) {
+func newTranscriptionTestServer(t *testing.T, status int, body string, cfgs ...*internalconfig.Config) (*gin.Engine, func() []capturedTranscription) {
 	t.Helper()
 	var mu sync.Mutex
 	var got []capturedTranscription
@@ -59,6 +59,9 @@ func newTranscriptionTestServer(t *testing.T, status int, body string) (*gin.Eng
 	t.Cleanup(upstream.Close)
 
 	cfg := &internalconfig.Config{}
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+	}
 	providerKey := util.OpenAICompatibleProviderKey("spark")
 	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
 	manager.RegisterExecutor(runtimeexecutor.NewOpenAICompatExecutor(providerKey, cfg))
@@ -146,6 +149,31 @@ func TestAudioTranscriptionsSyncPassthrough(t *testing.T) {
 	if c.path != "/v1/audio/transcriptions" || c.auth != "Bearer upstream-key" || c.model != "SPARK-ASR" ||
 		c.format != "diarized_json" || c.prompt != "饭耳" || c.fileName != "audio.m4a" || string(c.fileBytes) != "fake-m4a-bytes" {
 		t.Fatalf("unexpected upstream request: %+v", c)
+	}
+}
+
+// The fork README documents a payload replace rule that wraps hot words in
+// MOSS's default instruction; keep that config-only path working.
+func TestAudioTranscriptionsPayloadReplaceWrapsPrompt(t *testing.T) {
+	cfg := &internalconfig.Config{Payload: internalconfig.PayloadConfig{Replace: []internalconfig.PayloadReplaceRule{{
+		Models:       []internalconfig.PayloadModelRule{{Name: "SPARK-ASR", Protocol: "openai"}},
+		Target:       internalconfig.PayloadReplaceTarget{Paths: []string{"prompt"}},
+		Replacements: []internalconfig.PayloadReplacement{{"pattern": `(?s)^\s*(\S.*)$`, "replacement": "INSTRUCTION 热词提示：${1}"}},
+	}}}}
+	engine, captured := newTranscriptionTestServer(t, http.StatusOK, testDiarizedJSON, cfg)
+	for _, prompt := range []string{"饭耳，ISM。", ""} {
+		fields := map[string]string{"model": "SPARK-ASR", "response_format": "diarized_json"}
+		if prompt != "" {
+			fields["prompt"] = prompt
+		}
+		body, ct := transcriptionForm(t, fields, true)
+		if rec := doTranscription(engine, http.MethodPost, "/v1/audio/transcriptions", body, ct, ""); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+		}
+	}
+	calls := captured()
+	if len(calls) != 2 || calls[0].prompt != "INSTRUCTION 热词提示：饭耳，ISM。" || calls[1].prompt != "" || string(calls[0].fileBytes) != "fake-m4a-bytes" {
+		t.Fatalf("unexpected upstream requests: %+v", calls)
 	}
 }
 
