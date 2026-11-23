@@ -38,6 +38,12 @@ const (
 	openAICompatDefaultUserAgent            = "cli-proxy-openai-compat"
 )
 
+// Audio transcriptions reuse the image media path (raw multipart passthrough).
+const (
+	openAICompatTranscriptionHandlerType = "openai-transcription"
+	openAICompatTranscriptionsPath       = "/audio/transcriptions"
+)
+
 func ensureOpenAICompatUserAgent(r *http.Request, clientHeaders ...http.Header) {
 	if r == nil {
 		return
@@ -956,6 +962,9 @@ func openAICompatAuthHasRefreshToken(auth *cliproxyauth.Auth) bool {
 }
 
 func openAICompatImageEndpointPath(opts cliproxyexecutor.Options) string {
+	if opts.SourceFormat.String() == openAICompatTranscriptionHandlerType {
+		return openAICompatTranscriptionsPath
+	}
 	if opts.SourceFormat.String() != openAICompatImageHandlerType {
 		return ""
 	}
