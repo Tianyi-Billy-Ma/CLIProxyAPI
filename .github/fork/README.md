@@ -13,7 +13,10 @@ This fork tracks upstream `router-for-me/CLIProxyAPI` and adds one feature:
   `completed` (result fields merged in) or `failed` (`error.message`, `error.code`).
   Unknown, foreign or expired ids answer 404.
 - Jobs live in memory only: they are lost on restart, visible only to the API key
-  that created them, kept 24 hours after finishing, and at most 32 run at once (429 beyond).
+  that created them, kept 24 hours after finishing, and at most 32 are unfinished at once
+  (429 beyond). Only 4 are sent upstream at a time; the rest stay `queued`.
+- Each unfinished job keeps its whole upload in memory, so give the container room
+  (e.g., 2G rather than 512M when clients upload many 15-minute chunks at once).
 
 Config example (spark serves MOSS-Transcribe-Diarize as `SPARK-ASR`):
 
