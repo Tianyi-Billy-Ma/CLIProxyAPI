@@ -127,6 +127,9 @@ func (h *OpenAIAPIHandler) executeTranscription(ctx context.Context, model strin
 // key-model-access read from the gin context. A fresh gin context is used
 // because the request's own one is pooled and its log resources are cleaned up
 // once the 202 is sent.
+// shortcut: usage records of async jobs lack endpoint/client-IP metadata and
+// error-only request logs miss late upstream events; route the job through
+// GetContextWithCancel with an explicit status if those records matter.
 func transcriptionJobContext(c *gin.Context) context.Context {
 	jobGin, _ := gin.CreateTestContext(httptest.NewRecorder())
 	jobGin.Request = c.Request.WithContext(context.WithoutCancel(c.Request.Context()))
