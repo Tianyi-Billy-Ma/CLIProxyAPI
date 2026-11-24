@@ -11,6 +11,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -82,20 +83,10 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 		}})
 		return
 	}
-	// The job outlives the request. gin's Copy keeps the caller identity
-	// (userApiKey, accessProvider) that plugins such as key-model-access read,
-	// and the detached request context drops the request's cancellation.
-	jobGin := c.Copy()
-	jobGin.Request = c.Request.WithContext(context.WithoutCancel(c.Request.Context()))
-	jobCtx, jobCancel := h.GetContextWithCancel(h, jobGin, context.Background())
+	jobCtx := transcriptionJobContext(c)
 	go func() {
 		transcriptionJobs.setStatus(job.id, "processing")
 		resp, errMsg := h.executeTranscription(jobCtx, model, raw, headers)
-		if errMsg != nil {
-			jobCancel(errMsg.Error)
-		} else {
-			jobCancel(nil)
-		}
 		if errMsg != nil {
 			transcriptionJobs.fail(job.id, errMsg)
 			return
@@ -128,6 +119,23 @@ func (h *OpenAIAPIHandler) executeTranscription(ctx context.Context, model strin
 		Headers:       headers,
 		Path:          openAITranscriptionPath,
 	})
+}
+
+// transcriptionJobContext builds the context for a job that outlives its request.
+// It keeps request-scoped values (usage identity) without the request's
+// cancellation, and exposes only the caller identity keys that plugins such as
+// key-model-access read from the gin context. A fresh gin context is used
+// because the request's own one is pooled and its log resources are cleaned up
+// once the 202 is sent.
+func transcriptionJobContext(c *gin.Context) context.Context {
+	jobGin, _ := gin.CreateTestContext(httptest.NewRecorder())
+	jobGin.Request = c.Request.WithContext(context.WithoutCancel(c.Request.Context()))
+	for _, key := range []string{"userApiKey", "accessProvider", "accessMetadata"} {
+		if value, ok := c.Get(key); ok {
+			jobGin.Set(key, value)
+		}
+	}
+	return context.WithValue(jobGin.Request.Context(), "gin", jobGin)
 }
 
 // transcriptionJobOwner identifies the authenticated caller (access provider + principal).
