@@ -117,8 +117,12 @@ func (h *OpenAIAPIHandler) AudioTranscriptionRetrieve(c *gin.Context) {
 	c.Data(http.StatusOK, "application/json", body)
 }
 
+// vllmEmptyDiarizedError is vLLM's diarized_json error when the model output
+// has no complete [start][Sxx]text[end] segment, which is what silent audio gives.
+const vllmEmptyDiarizedError = "did not contain a valid diarized transcript"
+
 func (h *OpenAIAPIHandler) executeTranscription(ctx context.Context, model string, body []byte, headers http.Header) (handlers.ModelExecutionResponse, *interfaces.ErrorMessage) {
-	return h.ExecuteProtocolWithAuthManager(ctx, handlers.ProtocolExecutionRequest{
+	resp, errMsg := h.ExecuteProtocolWithAuthManager(ctx, handlers.ProtocolExecutionRequest{
 		EntryProtocol: openAITranscriptionHandlerType,
 		ExitProtocol:  openAITranscriptionHandlerType,
 		Model:         model,
@@ -126,6 +130,13 @@ func (h *OpenAIAPIHandler) executeTranscription(ctx context.Context, model strin
 		Headers:       headers,
 		Path:          openAITranscriptionPath,
 	})
+	// shortcut: a chunk with one malformed segment among real speech is also
+	// answered as empty; parse the model's raw text output if that matters.
+	if errMsg != nil && errMsg.StatusCode == http.StatusBadRequest && errMsg.Error != nil && strings.Contains(errMsg.Error.Error(), vllmEmptyDiarizedError) {
+		log.Warnf("transcription: model %s returned no diarized segments; answering with an empty transcript", model)
+		return handlers.ModelExecutionResponse{Body: []byte(`{"text":"","segments":[]}`)}, nil
+	}
+	return resp, errMsg
 }
 
 // transcriptionJobContext builds the context for a job that outlives its request.

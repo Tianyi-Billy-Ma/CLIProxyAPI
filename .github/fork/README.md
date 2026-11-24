@@ -12,6 +12,8 @@ This fork tracks upstream `router-for-me/CLIProxyAPI` and adds one feature:
   Poll `GET /v1/audio/transcriptions/{id}` for `queued`, `processing`,
   `completed` (result fields merged in) or `failed` (`error.message`, `error.code`).
   Unknown, foreign or expired ids answer 404.
+- Silent audio: vLLM rejects diarized_json output with no complete segment (400 "did not
+  contain a valid diarized transcript"); CPA answers it as `{"text":"","segments":[]}`.
 - Jobs live in memory only: they are lost on restart, visible only to the API key
   that created them, kept 24 hours after finishing, and at most 32 are unfinished at once
   (429 beyond). Only 4 are sent upstream at a time; the rest stay `queued`.
