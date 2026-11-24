@@ -82,12 +82,20 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 		}})
 		return
 	}
-	// The job outlives the request: keep request-scoped values (usage identity)
-	// but neither its cancellation nor the pooled gin context.
-	jobCtx := context.WithoutCancel(c.Request.Context())
+	// The job outlives the request. gin's Copy keeps the caller identity
+	// (userApiKey, accessProvider) that plugins such as key-model-access read,
+	// and the detached request context drops the request's cancellation.
+	jobGin := c.Copy()
+	jobGin.Request = c.Request.WithContext(context.WithoutCancel(c.Request.Context()))
+	jobCtx, jobCancel := h.GetContextWithCancel(h, jobGin, context.Background())
 	go func() {
 		transcriptionJobs.setStatus(job.id, "processing")
 		resp, errMsg := h.executeTranscription(jobCtx, model, raw, headers)
+		if errMsg != nil {
+			jobCancel(errMsg.Error)
+		} else {
+			jobCancel(nil)
+		}
 		if errMsg != nil {
 			transcriptionJobs.fail(job.id, errMsg)
 			return
