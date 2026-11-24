@@ -293,6 +293,24 @@ func TestAudioTranscriptionsAsyncWaitsForFreeSlot(t *testing.T) {
 	}
 }
 
+func TestAudioTranscriptionsSilentAudioIsEmptyTranscript(t *testing.T) {
+	const vllmSilence = `{"error":{"message":"Model output did not contain a valid diarized transcript","type":"BadRequestError","param":null,"code":400}}`
+	engine, _ := newTranscriptionTestServer(t, http.StatusBadRequest, vllmSilence)
+
+	body, ct := transcriptionForm(t, map[string]string{"model": "SPARK-ASR", "response_format": "diarized_json"}, true)
+	rec := doTranscription(engine, http.MethodPost, "/v1/audio/transcriptions", body, ct, "")
+	if rec.Code != http.StatusOK || ojson.GetBytes(rec.Body.Bytes(), "text").String() != "" || !ojson.GetBytes(rec.Body.Bytes(), "segments").IsArray() {
+		t.Fatalf("sync = %d %s", rec.Code, rec.Body.String())
+	}
+
+	body, ct = transcriptionForm(t, map[string]string{"model": "SPARK-ASR", "response_format": "diarized_json"}, true)
+	rec = doTranscription(engine, http.MethodPost, "/v1/audio/transcriptions", body, ct, "respond-async")
+	out := waitTranscriptionJob(t, engine, ojson.GetBytes(rec.Body.Bytes(), "id").String()).Body.Bytes()
+	if ojson.GetBytes(out, "status").String() != "completed" || !ojson.GetBytes(out, "segments").IsArray() {
+		t.Fatalf("async = %s", out)
+	}
+}
+
 func TestAudioTranscriptionsAsyncFailed(t *testing.T) {
 	engine, _ := newTranscriptionTestServer(t, http.StatusInternalServerError, `{"error":{"message":"model crashed"}}`)
 	body, ct := transcriptionForm(t, map[string]string{"model": "SPARK-ASR"}, true)
