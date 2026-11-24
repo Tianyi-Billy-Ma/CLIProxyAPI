@@ -339,3 +339,28 @@ func TestPreferRespondAsync(t *testing.T) {
 		}
 	}
 }
+
+func TestTranscriptionJobContextKeepsIdentityWithoutCancel(t *testing.T) {
+	reqCtx, cancel := context.WithCancel(context.WithValue(context.Background(), struct{ k string }{"req"}, "v"))
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", nil).WithContext(reqCtx)
+	c.Set("userApiKey", "k1")
+	c.Set("accessProvider", "config")
+	c.Set("API_RESPONSE", []byte("not copied"))
+
+	ctx := transcriptionJobContext(c)
+	cancel()
+	if ctx.Err() != nil {
+		t.Fatal("job context cancelled with its request")
+	}
+	if ctx.Value(struct{ k string }{"req"}) != "v" {
+		t.Fatal("request-scoped value lost")
+	}
+	jobGin, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || jobGin == c || jobGin.GetString("userApiKey") != "k1" || jobGin.GetString("accessProvider") != "config" {
+		t.Fatalf("job gin context missing caller identity: %+v", jobGin)
+	}
+	if _, exists := jobGin.Get("API_RESPONSE"); exists {
+		t.Fatal("request log state leaked into the job context")
+	}
+}
