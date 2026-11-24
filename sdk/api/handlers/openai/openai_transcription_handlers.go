@@ -31,7 +31,12 @@ const (
 	transcriptionJobTTL            = 24 * time.Hour
 	// maxActiveTranscriptionJobs bounds async uploads held in memory at once.
 	maxActiveTranscriptionJobs = 32
+	// maxRunningTranscriptionJobs bounds async jobs sent upstream at once; the
+	// rest wait as "queued". Each running job holds several copies of its upload.
+	maxRunningTranscriptionJobs = 4
 )
+
+var transcriptionSlots = make(chan struct{}, maxRunningTranscriptionJobs)
 
 // AudioTranscriptions proxies an OpenAI multipart transcription request to an
 // OpenAI-compatible upstream. With "Prefer: respond-async" it answers 202 with a
@@ -85,6 +90,8 @@ func (h *OpenAIAPIHandler) AudioTranscriptions(c *gin.Context) {
 	}
 	jobCtx := transcriptionJobContext(c)
 	go func() {
+		transcriptionSlots <- struct{}{}
+		defer func() { <-transcriptionSlots }()
 		transcriptionJobs.setStatus(job.id, "processing")
 		resp, errMsg := h.executeTranscription(jobCtx, model, raw, headers)
 		if errMsg != nil {

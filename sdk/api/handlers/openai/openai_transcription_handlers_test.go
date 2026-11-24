@@ -254,6 +254,45 @@ func TestAudioTranscriptionsAsyncCompleted(t *testing.T) {
 	}
 }
 
+func TestAudioTranscriptionsAsyncWaitsForFreeSlot(t *testing.T) {
+	engine, captured := newTranscriptionTestServer(t, http.StatusOK, testDiarizedJSON)
+	for i := 0; i < maxRunningTranscriptionJobs; i++ {
+		transcriptionSlots <- struct{}{}
+	}
+	drained := false
+	drain := func() {
+		if !drained {
+			drained = true
+			for i := 0; i < maxRunningTranscriptionJobs; i++ {
+				<-transcriptionSlots
+			}
+		}
+	}
+	t.Cleanup(drain)
+
+	body, ct := transcriptionForm(t, map[string]string{"model": "SPARK-ASR", "response_format": "diarized_json"}, true)
+	rec := doTranscription(engine, http.MethodPost, "/v1/audio/transcriptions", body, ct, "respond-async")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	id := ojson.GetBytes(rec.Body.Bytes(), "id").String()
+	// Give an unthrottled job ample time to finish; a throttled one never can.
+	for deadline := time.Now().Add(200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		poll := doTranscription(engine, http.MethodGet, "/v1/audio/transcriptions/"+id, nil, "", "")
+		if status := ojson.GetBytes(poll.Body.Bytes(), "status").String(); status != "queued" {
+			t.Fatalf("status with all slots busy = %q, want queued", status)
+		}
+		if n := len(captured()); n != 0 {
+			t.Fatalf("upstream called %d times while all slots busy", n)
+		}
+	}
+
+	drain()
+	if out := waitTranscriptionJob(t, engine, id).Body.Bytes(); ojson.GetBytes(out, "status").String() != "completed" {
+		t.Fatalf("poll after slot freed = %s", out)
+	}
+}
+
 func TestAudioTranscriptionsAsyncFailed(t *testing.T) {
 	engine, _ := newTranscriptionTestServer(t, http.StatusInternalServerError, `{"error":{"message":"model crashed"}}`)
 	body, ct := transcriptionForm(t, map[string]string{"model": "SPARK-ASR"}, true)
